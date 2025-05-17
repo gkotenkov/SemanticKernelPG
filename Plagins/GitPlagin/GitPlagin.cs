@@ -1,5 +1,13 @@
 ﻿using LibGit2Sharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.ChatCompletion;
+using Microsoft.SemanticKernel.Connectors.AzureOpenAI;
+using Microsoft.SemanticKernel.Embeddings;
+using System.ComponentModel;
+using Microsoft.SemanticKernel.Memory;
+
 
 namespace SemanticKernelPlayground.Plagins.GitPlagin
 {
@@ -7,6 +15,7 @@ namespace SemanticKernelPlayground.Plagins.GitPlagin
 	public class GitPlugin
 	{
 		private static Dictionary<string, string> PluginMemory { get; set; } = new();
+		public static IEnumerable<MethodDeclarationSyntax> methods { get; set; }
 
 		[KernelFunction("RememberRepo")]
 		public string RememberRepo(string repoPath)
@@ -113,6 +122,58 @@ namespace SemanticKernelPlayground.Plagins.GitPlagin
 			}
 
 		}
+
+		[KernelFunction("ScanFilesInRepo")]
+		public async Task<string> ScanFilesInRepo([Description("Semantic Kernel")] Kernel kernel)
+		{
+			if (!PluginMemory.TryGetValue("repo path", out var repoPath))
+				return "No Git repository path was provided.";
+
+			var chatService = kernel.GetRequiredService<IChatCompletionService>();
+			var embeddingGen = kernel.GetRequiredService<ITextEmbeddingGenerationService>();
+			var memoryStore = kernel.GetRequiredService<IMemoryStore>();
+
+			int count = 0;
+
+			foreach (var file in Directory.GetFiles(repoPath, "*.cs", SearchOption.AllDirectories))
+			{
+				var code = File.ReadAllText(file);
+				var tree = CSharpSyntaxTree.ParseText(code);
+				var root = tree.GetRoot();
+				var methods = root.DescendantNodes().OfType<MethodDeclarationSyntax>();
+
+				foreach (var method in methods)
+				{
+					var methodCode = method.ToFullString();
+					var prompt = $"Describe what method does:\n{methodCode}";
+					var chat = new ChatHistory(prompt);
+
+					var response = await chatService.GetChatMessageContentAsync(
+						chat,
+						new AzureOpenAIPromptExecutionSettings(),
+						kernel);
+
+					if (string.IsNullOrWhiteSpace(response?.Content)) continue;
+
+					var embedding = await embeddingGen.GenerateEmbeddingAsync(response.Content);
+
+					var record = MemoryRecord.LocalRecord(
+						id: Guid.NewGuid().ToString(),
+						text: response.Content,
+						embedding: embedding,
+						description: method.Identifier.Text,
+						additionalMetadata: null
+						);
+
+					await memoryStore.UpsertAsync("code-docs", record);
+
+					count++;
+				}
+			}
+
+			return $"Added {count} method descriptions to memory";
+		}
+
 
 	}
 }
